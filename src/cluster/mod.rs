@@ -34,7 +34,7 @@ use crate::protocol::redis::{
 use crate::slowlog::Slowlog;
 use crate::utils::{crc16, trim_hash_tag};
 
-const FETCH_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_FETCH_INTERVAL: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT_MS: u64 = 1_000;
 const MAX_REDIRECTS: u8 = 5;
 const PIPELINE_LIMIT: usize = 32;
@@ -136,6 +136,10 @@ impl ClusterProxy {
 
         // trigger an immediate topology fetch
         trigger_tx.send(()).ok();
+        let fetch_interval = config
+            .fetch_interval
+            .and_then(|value| (value > 0).then(|| Duration::from_millis(value)))
+            .unwrap_or(DEFAULT_FETCH_INTERVAL);
         tokio::spawn(fetch_topology(
             cluster,
             config.servers.clone(),
@@ -143,6 +147,7 @@ impl ClusterProxy {
             proxy.slots.clone(),
             trigger_rx,
             Some(cache_trackers),
+            fetch_interval,
         ));
 
         Ok(proxy)
@@ -1394,8 +1399,9 @@ async fn fetch_topology(
     slots: Arc<watch::Sender<SlotMap>>,
     mut trigger: mpsc::UnboundedReceiver<()>,
     tracker: Option<Arc<CacheTrackerSet>>,
+    fetch_interval: Duration,
 ) {
-    let mut ticker = tokio::time::interval(FETCH_INTERVAL);
+    let mut ticker = tokio::time::interval(fetch_interval);
     loop {
         tokio::select! {
             _ = ticker.tick() => {},

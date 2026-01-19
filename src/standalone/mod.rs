@@ -13,7 +13,7 @@ use md5::Digest;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+use tokio::time::{sleep, timeout};
 use tokio_util::codec::{Framed, FramedParts};
 use tracing::{debug, info, warn};
 
@@ -36,6 +36,12 @@ use crate::utils::trim_hash_tag;
 const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 const VIRTUAL_NODE_FACTOR: usize = 40;
 const FRONT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const DEFAULT_HEARTBEAT_FAIL_LIMIT: u8 = 1;
+
+fn duration_from_millis(value: Option<u64>) -> Option<Duration> {
+    value.and_then(|millis| (millis > 0).then(|| Duration::from_millis(millis)))
+}
 
 #[derive(Clone)]
 struct NodeEntry {
@@ -93,11 +99,21 @@ impl StandaloneProxy {
             if let Some(backend) = backend_override {
                 backend
             } else {
+                let heartbeat_interval_ok = duration_from_millis(config.ping_succ_interval)
+                    .or_else(|| duration_from_millis(config.ping_interval))
+                    .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
+                let heartbeat_interval_fail =
+                    duration_from_millis(config.ping_interval).unwrap_or(heartbeat_interval_ok);
+                let heartbeat_fail_limit =
+                    config.ping_fail_limit.unwrap_or(DEFAULT_HEARTBEAT_FAIL_LIMIT);
                 let connector = Arc::new(RedisConnector::new(
                     runtime.clone(),
                     DEFAULT_TIMEOUT_MS,
                     backend_auth.clone(),
                     config.backend_resp_version,
+                    heartbeat_interval_ok,
+                    heartbeat_interval_fail,
+                    heartbeat_fail_limit,
                 ));
                 let pool = Arc::new(ConnectionPool::new(cluster.clone(), connector));
                 Arc::new(PoolBackendExecutor::new(pool))
@@ -966,7 +982,9 @@ struct RedisConnector {
     default_timeout_ms: u64,
     reconnect_delay: Duration,
     max_reconnect_delay: Duration,
-    heartbeat_interval: Duration,
+    heartbeat_interval_ok: Duration,
+    heartbeat_interval_fail: Duration,
+    heartbeat_fail_limit: u8,
     backend_auth: Option<BackendAuth>,
     backend_resp_version: RespVersion,
 }
@@ -977,13 +995,18 @@ impl RedisConnector {
         default_timeout_ms: u64,
         backend_auth: Option<BackendAuth>,
         backend_resp_version: RespVersion,
+        heartbeat_interval_ok: Duration,
+        heartbeat_interval_fail: Duration,
+        heartbeat_fail_limit: u8,
     ) -> Self {
         Self {
             runtime,
             default_timeout_ms,
             reconnect_delay: Duration::from_millis(100),
             max_reconnect_delay: Duration::from_secs(2),
-            heartbeat_interval: Duration::from_secs(20),
+            heartbeat_interval_ok,
+            heartbeat_interval_fail,
+            heartbeat_fail_limit,
             backend_auth,
             backend_resp_version,
         }
@@ -1001,8 +1024,8 @@ impl RedisConnector {
         #[cfg(any(unix, windows))]
         {
             let keepalive = TcpKeepalive::new()
-                .with_time(self.heartbeat_interval)
-                .with_interval(self.heartbeat_interval);
+                .with_time(self.heartbeat_interval_ok)
+                .with_interval(self.heartbeat_interval_ok);
             if let Err(err) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
                 warn!(
                     backend = %connect_target,
@@ -1185,9 +1208,11 @@ impl Connector<RedisCommand> for RedisConnector {
     ) {
         info!(cluster = %cluster, backend = %node.as_str(), "starting backend session");
         let mut connection: Option<Framed<TcpStream, RespCodec>> = None;
-        let mut heartbeat = interval(self.heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut heartbeat_interval = self.heartbeat_interval_ok;
+        let heartbeat = sleep(heartbeat_interval);
+        tokio::pin!(heartbeat);
         let mut current_delay = self.reconnect_delay;
+        let mut heartbeat_failures: u8 = 0;
 
         loop {
             tokio::select! {
@@ -1265,6 +1290,7 @@ impl Connector<RedisCommand> for RedisConnector {
 
                         match result {
                             Ok(resp) => {
+                                heartbeat_failures = 0;
                                 let mut result_label = if matches!(resp, RespValue::Error(_)) {
                                     "resp_error"
                                 } else {
@@ -1305,13 +1331,14 @@ impl Connector<RedisCommand> for RedisConnector {
                                 metrics::backend_error(&cluster, node.as_str(), kind);
                                 let _ = respond_to.send(Err(err));
                                 connection = None;
+                                heartbeat_failures = 0;
                                 current_delay = self.increase_delay(current_delay);
                                 sleep(current_delay).await;
                             }
                         }
                     }
                 }
-                _ = heartbeat.tick(), if connection.is_some() => {
+                _ = &mut heartbeat, if connection.is_some() => {
                     if let Some(ref mut framed) = connection {
                         let start = Instant::now();
                         let result = self.heartbeat(framed).await;
@@ -1323,6 +1350,8 @@ impl Connector<RedisCommand> for RedisConnector {
                         );
                         match result {
                             Ok(()) => {
+                                heartbeat_failures = 0;
+                                heartbeat_interval = self.heartbeat_interval_ok;
                                 metrics::backend_heartbeat(&cluster, node.as_str(), true);
                                 current_delay = self.reconnect_delay;
                             }
@@ -1335,10 +1364,20 @@ impl Connector<RedisCommand> for RedisConnector {
                                     error = %err,
                                     "standalone backend heartbeat failed"
                                 );
-                                connection = None;
-                                current_delay = self.increase_delay(current_delay);
+                                heartbeat_interval = self.heartbeat_interval_fail;
+                                if self.heartbeat_fail_limit > 0 {
+                                    heartbeat_failures = heartbeat_failures.saturating_add(1);
+                                    if heartbeat_failures >= self.heartbeat_fail_limit {
+                                        connection = None;
+                                        heartbeat_failures = 0;
+                                        current_delay = self.increase_delay(current_delay);
+                                    }
+                                }
                             }
                         }
+                        heartbeat
+                            .as_mut()
+                            .reset((Instant::now() + heartbeat_interval).into());
                     }
                 }
             }
